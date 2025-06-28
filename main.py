@@ -1,113 +1,162 @@
+from datetime import timedelta
+
 from AlgorithmImports import *
-from datetime import datetime, timedelta, timezone
 
 
-class WeeklyMultiTradeExecution(QCAlgorithm):
-    def initialize(self,
-                   day_of_week: int = 3,
-                   hour_of_day: int = 10,
-                   trade_duration_hours: int = 336,
-                   order_offset_ticks: int = 5,
-                   order_expiry_hours: int = 24) -> None:
-        """
-        Adds two new parameters:
-        :param order_offset_ticks: How many ticks above/below the current price to place the stop/limit order.
-        :param order_expiry_hours: How many hours a pending order can wait to be filled before it's canceled.
-        """
+class RuleDrivenExecution(QCAlgorithm):
+    def initialize(self, rule_string: str = "4,0,2122,18003,326,336,8") -> None:
         self.set_start_date(2023, 1, 1)
         self.set_end_date(2023, 12, 31)
         self.set_cash(100000)
-
-        day_of_week_enum = self._convert_int_to_day_of_week(day_of_week)
         self._xauusd = self.add_cfd("XAUUSD", Resolution.MINUTE).symbol
 
-        # --- Parameters for the weekly trade ---
-        self._order_offset_ticks: int = order_offset_ticks # NEWLY PARAMETERIZED
-        self._order_expiry_hours = timedelta(hours=order_expiry_hours) # NEW PARAMETER
-        self._order_above: bool = True
-        self._trade_quantity: int = 10
-        self._trade_duration = timedelta(hours=trade_duration_hours)
+        try:
+            parts = rule_string.split(',')
+            if len(parts) != 7:
+                raise ValueError(f"Expected 7 comma-separated values, but got {len(parts)}.")
+            day_of_week = int(parts[0])
+            hour_of_day = int(parts[1])
+            self._stop_loss_ticks = abs(int(parts[2]))
+            self._take_profit_ticks = abs(int(parts[3]))
+            self._entry_offset_ticks = int(parts[4])
+            # --- ADDED: Correctly parse and store the trade duration ---
+            self._trade_duration = timedelta(hours=int(parts[5]))
+            self._order_expiry_hours = timedelta(hours=int(parts[6]))
+        except Exception as e:
+            raise ValueError(f"Failed to parse rule_string. Error: {e}")
 
-        # --- Data structures to track trades ---
-        # For filled trades (positions)
-        self.open_trade_details = {}
-        # NEW: For pending orders that are not yet filled
-        self.pending_orders = {}
+        self._pending_orders: dict[int, float] = {}
+        # --- MODIFIED: This will now also store the entry timestamp ---
+        # entry_order_id -> { 'tp_id': id, 'sl_id': id, 'entry_timestamp': timestamp }
+        self._bracket_orders: dict[int, dict] = {}
 
-        # Schedule the weekly trade entry
+        day_of_week_enum = self._convert_int_to_day_of_week(day_of_week)
         self.schedule.on(
             self.date_rules.every(day_of_week_enum),
             self.time_rules.at(hour_of_day, 0, time_zone=TimeZones.UTC),
-            self.weekly_trade_entry
+            self.execute_rule
         )
 
-    def weekly_trade_entry(self) -> None:
+    def execute_rule(self) -> None:
+        if self._stop_loss_ticks <= 0 or self._take_profit_ticks <= 0:
+            self.error("Stop-loss and take-profit ticks must be positive values.")
+            return
+
+        if self.portfolio.invested or len(self.transactions.get_open_orders()) > 0:
+            self.debug("Skipping rule execution: Already have open positions or pending orders.")
+            return
+
         price = self.securities[self._xauusd].price
-        tick_size = self.securities[self._xauusd].symbol_properties.minimum_price_variation
+        quantity = 10
+        self.debug(f"--- EXECUTING RULE on {self.utc_time.strftime('%Y-%m-%d %H:%M')} (UTC) ---")
 
-        self.debug(f"--- ATTEMPTING ENTRY on {self.utc_time.strftime('%Y-%m-%d %H:%M')} (UTC) ---")
+        is_buy_stop = self._entry_offset_ticks > 0
+        entry_price_offset = abs(self._entry_offset_ticks) / 100.0
 
-        # --- MODIFIED: Use the new parameter for the order price ---
-        if self._order_above:
-            stop_price = price + (self._order_offset_ticks * tick_size)
-            ticket = self.stop_market_order(self._xauusd, self._trade_quantity, stop_price)
+        if is_buy_stop:
+            entry_price = price + entry_price_offset
+            ticket = self.stop_market_order(self._xauusd, quantity, entry_price, tag="Entry Order")
         else:
-            limit_price = price - (self._order_offset_ticks * tick_size)
-            ticket = self.limit_order(self._xauusd, self._trade_quantity, limit_price)
+            entry_price = price - entry_price_offset
+            ticket = self.limit_order(self._xauusd, quantity, entry_price, tag="Entry Order")
 
-        # --- NEW: Track the pending order for expiration ---
         if ticket.status != OrderStatus.INVALID:
             expiry_time = self.utc_time + self._order_expiry_hours
-            self.pending_orders[ticket.order_id] = expiry_time.timestamp()
-            self.debug(f"Order {ticket.order_id} submitted. It will expire if not filled by {expiry_time.strftime('%Y-%m-%d %H:%M')}.")
+            self._pending_orders[ticket.order_id] = expiry_time.timestamp()
+            self.debug(f"Entry order {ticket.order_id} submitted. Expires if not filled by {expiry_time.strftime('%Y-%m-%d %H:%M')}.")
 
     def on_order_event(self, order_event: OrderEvent) -> None:
-        # No longer need to check for filled status here first, as we handle all statuses
         order_id = order_event.order_id
+        ticket = self.transactions.get_order_ticket(order_id)
+        if not ticket:
+            return
 
-        # If the order is no longer pending, remove it from our tracking dictionary
-        if order_id in self.pending_orders:
-            if order_event.status == OrderStatus.FILLED or \
-                    order_event.status == OrderStatus.CANCELED or \
-                    order_event.status == OrderStatus.INVALID:
-                del self.pending_orders[order_id]
-                self.debug(f"Order {order_id} is no longer pending (Status: {order_event.status}). Removed from expiry tracking.")
+        if order_event.status == OrderStatus.FILLED and ticket.tag == "Entry Order":
+            fill_price = order_event.fill_price
+            quantity = abs(ticket.quantity)
+            direction = 1 if ticket.quantity > 0 else -1
 
-        # Handle logging for filled entry and exit orders
-        if order_event.status == OrderStatus.FILLED:
-            ticket = self.transactions.get_order_ticket(order_id)
-            if not ticket: return
+            tp_price = fill_price + direction * (self._take_profit_ticks / 100.0)
+            sl_price = fill_price - direction * (self._stop_loss_ticks / 100.0)
 
-            if ticket.quantity > 0:
-                close_time_object = order_event.utc_time + self._trade_duration
-                close_timestamp = close_time_object.timestamp()
-                self.open_trade_details[order_id] = close_timestamp
-                self.debug(f"ENTRY EXECUTED: OrderID {order_id} filled at ${order_event.fill_price:.2f}. "
-                           f"Scheduled exit at {datetime.fromtimestamp(close_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')}.")
-            elif ticket.quantity < 0:
-                self.debug(f"EXIT EXECUTED: Closing OrderID {order_id} filled at ${order_event.fill_price:.2f}.")
-                self.debug("------------------------------------------------------")
+            tp_ticket = self.limit_order(self._xauusd, -direction * quantity, tp_price, tag="TakeProfit")
+            sl_ticket = self.stop_market_order(self._xauusd, -direction * quantity, sl_price, tag="StopLoss")
+
+            # --- MODIFIED: Store the entry timestamp along with the SL/TP order IDs ---
+            self._bracket_orders[order_id] = {
+                'tp_id': tp_ticket.order_id,
+                'sl_id': sl_ticket.order_id,
+                'entry_timestamp': order_event.utc_time.timestamp()
+            }
+            self.debug(f"ENTRY EXECUTED: OrderID {order_id} filled at ${fill_price:.2f}. TP: {tp_price:.2f}, SL: {sl_price:.2f}")
+
+        # If a TP/SL order fills, clean up the corresponding entry from our tracker
+        entry_id_to_remove = -1
+        for entry_id, ids in self._bracket_orders.items():
+            if order_id in [ids['tp_id'], ids['sl_id']]:
+                if order_event.status == OrderStatus.FILLED:
+                    # Cancel the other OCO order
+                    other_id = ids['sl_id'] if order_id == ids['tp_id'] else ids['tp_id']
+                    cticket = self.transactions.get_order_ticket(other_id)
+                    if cticket and cticket.status in [OrderStatus.NEW, OrderStatus.SUBMITTED, OrderStatus.NONE]:
+                        cticket.cancel("Opposite bracket leg filled")
+
+                    self.debug(f"EXIT EXECUTED: OrderID {order_id} ({ticket.tag}) filled at ${order_event.fill_price:.2f}.")
+                    entry_id_to_remove = entry_id
+                break
+
+        if entry_id_to_remove != -1:
+            del self._bracket_orders[entry_id_to_remove]
+
+        # Clean up expired pending entry orders
+        if order_id in self._pending_orders and ticket.tag == "Entry Order":
+            if order_event.status in [OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.INVALID]:
+                del self._pending_orders[order_id]
+                self.debug(f"Entry Order {order_id} is no longer pending (Status: {order_event.status}).")
 
     def on_data(self, slice: Slice) -> None:
-        # --- NEW: Loop to check for and cancel expired pending orders ---
-        for order_id, expiry_timestamp in list(self.pending_orders.items()):
+        # 1. Cancel expired pending entry orders
+        for order_id, expiry_timestamp in list(self._pending_orders.items()):
             if self.utc_time.timestamp() >= expiry_timestamp:
                 ticket = self.transactions.get_order_ticket(order_id)
-                if ticket:
-                    ticket.cancel() # Cancel the order
-                    self.log(f"CANCELED: Order {order_id} expired without being filled.")
+                if ticket and ticket.status in [OrderStatus.NEW, OrderStatus.SUBMITTED, OrderStatus.NONE]:
+                    ticket.cancel("Order expired before fill")
+                    self.log(f"CANCELED: Entry Order {order_id} expired without being filled.")
+                del self._pending_orders[order_id]
 
-        # --- Existing loop to manage open positions ---
-        for order_id, close_timestamp in list(self.open_trade_details.items()):
-            if self.time.timestamp() >= close_timestamp:
-                self.debug(f"EXIT TRIGGERED: Time limit reached for original OrderID {order_id}. Submitting closing order.")
-                ticket = self.transactions.get_order_ticket(order_id)
-                if ticket:
-                    self.market_order(self._xauusd, -ticket.quantity_filled)
-                if order_id in self.open_trade_details:
-                    del self.open_trade_details[order_id]
+        # --- NEW: Check for time-based exits for open positions ---
+        for entry_id, details in list(self._bracket_orders.items()):
+            entry_timestamp = details['entry_timestamp']
+
+            # Calculate when the trade should be closed due to time
+            time_exit_timestamp = entry_timestamp + self._trade_duration.total_seconds()
+
+            if self.utc_time.timestamp() >= time_exit_timestamp:
+                self.debug(f"EXIT TRIGGERED (TIME LIMIT): Trade from Entry Order {entry_id} has expired.")
+
+                # IMPORTANT: Cancel the outstanding SL and TP orders before liquidating
+                tp_id = details['tp_id']
+                sl_id = details['sl_id']
+
+                tp_ticket = self.transactions.get_order_ticket(tp_id)
+                if tp_ticket and tp_ticket.status in [OrderStatus.NEW, OrderStatus.SUBMITTED, OrderStatus.NONE]:
+                    tp_ticket.cancel("Time limit exit")
+
+                sl_ticket = self.transactions.get_order_ticket(sl_id)
+                if sl_ticket and sl_ticket.status in [OrderStatus.NEW, OrderStatus.SUBMITTED, OrderStatus.NONE]:
+                    sl_ticket.cancel("Time limit exit")
+
+                # Liquidate the position
+                self.liquidate(self._xauusd)
+                self.debug("Position liquidated due to time limit.")
+
+                # Remove the entry from our tracker
+                del self._bracket_orders[entry_id]
 
     def _convert_int_to_day_of_week(self, day_of_week: int) -> DayOfWeek:
         mapping = {1: DayOfWeek.MONDAY, 2: DayOfWeek.TUESDAY, 3: DayOfWeek.WEDNESDAY,
                    4: DayOfWeek.THURSDAY, 5: DayOfWeek.FRIDAY, 6: DayOfWeek.SATURDAY, 7: DayOfWeek.SUNDAY}
-        return mapping.get(day_of_week, DayOfWeek.WEDNESDAY)
+        day = mapping.get(day_of_week)
+        if day is None:
+            raise ValueError(f"Invalid day_of_week '{day_of_week}'. Please use a value from 1 (Monday) to 7 (Sunday).")
+        return day
