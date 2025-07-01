@@ -1,10 +1,11 @@
 from AlgorithmImports import *
 from datetime import datetime, timedelta, timezone
 
+#         self.set_start_date(2010, 6, 6)
 class RuleDrivenExecution(QCAlgorithm):
     def initialize(self, rule_string: str = "4,0,2122,18003,326,336,8") -> None:
-        self.set_start_date(2023, 1, 1)
-        self.set_end_date(2023, 12, 31)
+        self.set_start_date(2024, 3, 29)
+        self.set_end_date(2024, 6, 29)
         self.set_cash(100000)
         self._xauusd = self.add_cfd("XAUUSD", Resolution.MINUTE).symbol
 
